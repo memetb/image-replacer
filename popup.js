@@ -1,18 +1,21 @@
+const button = document.getElementById('toggle');
+
+let enabled = true;
+
+function render() {
+  button.textContent = enabled ? 'Disable image replacement' : 'Enable image replacement';
+  button.dataset.state = enabled ? 'on' : 'off';
+}
+
 chrome.storage.local.get('enabled', (data) => {
-    const enabled = data.enabled !== false; // default true
-    const btn = document.getElementById('toggle');
-    
-    btn.textContent = enabled ? 'Disable Image Replacement' : 'Enable Image Replacement';
-    
-    btn.addEventListener('click', () => {
-        chrome.storage.local.set({ enabled: !enabled });
-        btn.textContent = !enabled ? 'Disable Image Replacement' : 'Enable Image Replacement';
-        
-        // Notify content script to reload
-        chrome.tabs.query({}, (tabs) => {
-            tabs.forEach(tab => {
-                chrome.tabs.sendMessage(tab.id, { action: 'toggle' }).catch(() => {});
-            });
-        });
-    });
+  enabled = data?.enabled !== false; // default on
+  render();
+});
+
+// Content scripts pick this up via chrome.storage.onChanged, so there's no
+// separate broadcast to keep in sync with the stored value.
+button.addEventListener('click', () => {
+  enabled = !enabled;
+  chrome.storage.local.set({ enabled });
+  render();
 });
