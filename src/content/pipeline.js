@@ -348,6 +348,51 @@
     return count;
   }
 
+  /**
+   * What the right-click menu could usefully do at this position.
+   *
+   * `deep` also looks inside the target, matching what `restoreFromPath` will
+   * actually do. That scan is only worth paying for on an actual right-click --
+   * pointer tracking calls this on every element the pointer crosses, where the
+   * ancestor walk alone is the right cost.
+   */
+  function inspectPath(path, { deep = false } = {}) {
+    const result = { restore: false, replace: false, restoreAll: anyActive() };
+
+    for (const node of path) {
+      if (node?.nodeType !== 1) continue;
+      const records = recordsFor(node);
+      if (records.some((r) => ACTIVE.has(r.state))) {
+        result.restore = true;
+        return result;
+      }
+      if (records.some((r) => r.state === 'restored')) {
+        result.replace = true;
+        return result;
+      }
+    }
+
+    if (!deep) return result;
+
+    const target = path.find((n) => n?.nodeType === 1);
+    if (target?.querySelectorAll) {
+      for (const el of target.querySelectorAll('*')) {
+        if (activeRecordsFor(el).length) {
+          result.restore = true;
+          break;
+        }
+      }
+    }
+    return result;
+  }
+
+  function anyActive() {
+    for (const record of live) {
+      if (ACTIVE.has(record.state) && record.el.isConnected) return true;
+    }
+    return false;
+  }
+
   function restoreAll() {
     let count = 0;
     for (const record of [...live]) {
@@ -408,6 +453,7 @@
   IR.pipeline = {
     process,
     runAdapter,
+    inspectPath,
     restoreFromPath,
     restoreAll,
     replaceFromPath,

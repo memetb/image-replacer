@@ -1,10 +1,12 @@
 # Image Replacer
 
-An MV3 browser extension for Chrome and Firefox that replaces every image on a
-page with a colour mosaic built from that image's own palette, and lets you
-bring any of them back with a right-click.
+An MV3 browser extension for Chrome and Firefox that replaces images with a
+colour mosaic built from each image's own palette, and lets you bring any of
+them back with a right-click.
 
-Replacement happens in two passes: an image is blanked the instant it is seen,
+It is **off by default and everywhere**. Nothing is touched until you switch a
+site on, and that choice is remembered per site. On a site that is switched on,
+replacement happens in two passes: an image is blanked the instant it is seen,
 then upgraded to its mosaic when that is ready.
 
 ## Install
@@ -18,20 +20,48 @@ Add-on** → pick `manifest.json`.
 > **Firefox users: grant host permissions.** Firefox MV3 treats
 > `host_permissions` as opt-in, so they are *not* granted on install. Open
 > `about:addons` → Image Replacer → Permissions → enable **Access your data for
-> all websites**. Without it the extension still replaces every image, but the
-> background fetch is blocked by CORS, so mosaics are synthesized from the image
-> URL rather than sampled from the image's own palette.
+> all websites**.
+>
+> Without them the extension cannot work at all on Firefox: the tab's URL is
+> withheld, so it can't tell which site you're on, and the toolbar button will
+> say the page isn't available. Granting them also unblocks the background
+> fetch — otherwise mosaics get synthesized from the image URL rather than
+> sampled from the image's own palette.
 
 ## Using it
 
-- Images are replaced automatically on every page, including ones the page adds
-  later. Each one blanks immediately and fills in with its mosaic a moment
-  later.
-- **Right-click → Restore** puts back the image under the cursor.
-- **Right-click → Restore all images on this page** puts back everything.
-- **Right-click → Replace again** re-replaces something you restored.
-- The toolbar button toggles the extension. Turning it off restores the current
-  page; turning it back on replaces again.
+Nothing happens until you switch a site on. Two ways to do it, and they are the
+same switch:
+
+- **Right-click anywhere → Image Replacer → Always Replace Images from this
+  site.** It is a checkbox; clicking it again switches the site back off.
+- **The toolbar button**, which reads *Replace images on this site* or *Disable
+  for this site* depending on where you are.
+
+The toolbar icon shows the state at a glance: a green **ON** badge and a
+full-colour icon where the extension is working, a faded icon where it isn't.
+
+Once a site is on, its images are replaced automatically, including ones the
+page adds later. Each one blanks immediately and fills in with its mosaic a
+moment later. The rest of the right-click menu acts on individual images:
+
+- **Restore** puts back the image under the cursor.
+- **Restore all images on this page** puts back everything.
+- **Replace again** re-replaces something you restored.
+
+Those three are greyed out when they would do nothing — the menu can be opened
+anywhere, so most of the time there is no image under the cursor to act on.
+
+### Which sites
+
+A site is a **hostname**. `example.com` and `docs.example.com` are separate
+entries, because they are frequently unrelated; `http://` and `https://` of the
+same host are one entry.
+
+Every frame in a tab follows the site in the address bar, so switching on a site
+also covers the images in its cross-origin iframes. Browser-internal pages
+(`chrome://`, `about:`) can't be switched on at all, and the toolbar button says
+so.
 
 ## What counts as an image
 
@@ -58,6 +88,23 @@ draw to it as part of their normal operation.
         ◀─write── plumbing   ──2──▶  path        ──msg───▶  replacement.js
                                                             slow pass (bg)
 ```
+
+### Deciding whether to run at all
+
+`src/sites.js` owns the list and the hostname rule. Everything else asks it.
+
+A content script cannot make this decision itself. A subframe only knows its own
+URL, and "this site" means the site in the address bar — so at `document_start`
+each content script asks the background context, which reads `sender.tab.url`,
+and does nothing until the answer arrives. That is also why the extension being
+off costs a page essentially nothing: one message, no scanning, no observers
+doing work.
+
+Writing the list is the only thing a toggle does. `chrome.storage.onChanged` in
+the background is the single fan-out point, so the context menu, the popup, and
+a second window's copy of either all take the same path: it re-evaluates every
+open tab, pushes the new state into each one's frames, and repaints the icons.
+Switching a site off restores its pages; switching it back on replaces again.
 
 ### The two passes
 
@@ -117,6 +164,19 @@ source URLs off an element and how to write them back — `sources`, `capture`,
 `apply`, `restore`. It contains no image logic and never decides what a
 replacement looks like. Supporting a new asset type means adding an adapter
 here and nothing else.
+
+**`src/menus.js` and `src/indicator.js` are the two bits of chrome-facing UI.**
+menus.js defines the right-click items and applies state to them; indicator.js
+paints the toolbar badge, title and icon per tab. The faded "off" icon is
+generated at runtime from the shipped PNGs, so there is no second set of image
+files to keep in sync.
+
+The restore items are kept in the right state by the content script reporting
+what is under the pointer as it moves, rather than when the menu opens. Chrome
+has no "menu is about to show" event, and computing it on the `contextmenu`
+event alone races with the menu being built — `mouseover` fires when the pointer
+crosses into a new element, and the report is skipped unless the answer changed,
+so the state is already correct by the time anyone right-clicks.
 
 **`src/background.js` runs the modification in the background context**, not the
 page. This is what makes replacement work at all: a content-script
@@ -182,8 +242,13 @@ npm run lint:firefox  # validates the manifest against Firefox's schema
 `test/e2e.js` loads the unpacked extension into Chromium and drives a real page
 whose images are served **from a different port with no CORS headers** — the
 exact case that silently failed before. It checks every asset type in the table
-above, plus both passes, restore, restore-all, replace-again, the enable/disable
-toggle, and the unfetchable-source fallback.
+above, plus both passes, restore, restore-all, replace-again, the per-site
+switch, and the unfetchable-source fallback.
+
+It starts by checking that a fresh profile replaces nothing, then switches the
+site on through `handleMenuClick` — the same function Chrome calls, since a menu
+item cannot be clicked programmatically — and checks the badge, title and menu
+state that follow.
 
 The fast pass is checked against images whose responses the fixture server holds
 open, so the blank is observably in place before the mosaic can exist. Note that

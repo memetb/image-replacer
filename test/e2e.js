@@ -65,6 +65,73 @@ async function main() {
     let [worker] = context.serviceWorkers();
     if (!worker) worker = await context.waitForEvent('serviceworker', { timeout: 15000 });
 
+    // ---- default off -------------------------------------------------------
+    // Nothing is replaced until a site is opted in, so this has to be checked
+    // before anything switches the test site on.
+    console.log('\ndefault off');
+
+    const cold = await context.newPage();
+    await cold.goto('http://127.0.0.1:8801/', { waitUntil: 'load' });
+    await cold.waitForTimeout(1200);
+
+    const untouched = await cold.evaluate(() => ({
+      plain: document.querySelector('#plain').getAttribute('src'),
+      bg: getComputedStyle(document.querySelector('#bg')).backgroundImage,
+    }));
+    check('images are untouched on a site that is not opted in', untouched.plain === `${imgOrigin}/a.png`, untouched.plain);
+    check('backgrounds are untouched too', untouched.bg.includes('/bg.png'), untouched.bg.slice(0, 60));
+
+    const coldBadge = await worker.evaluate(async () => {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      return chrome.action.getBadgeText({ tabId: tab.id });
+    });
+    check('toolbar badge is empty when off', coldBadge === '', `"${coldBadge}"`);
+
+    // Switching on via the real context-menu handler. A menu item can't be
+    // clicked programmatically, so this calls the handler Chrome would call.
+    await worker.evaluate(async () => {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      await globalThis.ImageReplacerBackground.handleMenuClick(
+        { menuItemId: globalThis.ImageReplacerMenus.ID.site },
+        tab,
+      );
+    });
+
+    await cold
+      .waitForFunction(
+        (pixel) => {
+          const v = document.querySelector('#plain').src;
+          return v.startsWith('data:image/') && v !== pixel;
+        },
+        BLANK_PIXEL,
+        { timeout: 10000 },
+      )
+      .catch(() => {});
+    const afterOptIn = await cold.getAttribute('#plain', 'src');
+    check(
+      '"Always Replace Images from this site" switches the site on',
+      afterOptIn !== `${imgOrigin}/a.png` && afterOptIn.startsWith('data:image/'),
+      afterOptIn.slice(0, 40),
+    );
+
+    const storedSites = await worker.evaluate(() => globalThis.ImageReplacerSites.allowedSites());
+    check('the site is remembered by hostname', storedSites['127.0.0.1'] === true, JSON.stringify(storedSites));
+
+    const warmBadge = await worker.evaluate(async () => {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      return {
+        badge: await chrome.action.getBadgeText({ tabId: tab.id }),
+        title: await chrome.action.getTitle({ tabId: tab.id }),
+      };
+    });
+    check('toolbar badge marks the tab as active', warmBadge.badge === 'ON', `"${warmBadge.badge}"`);
+    check('toolbar title names the site', warmBadge.title.includes('127.0.0.1'), warmBadge.title);
+
+    const menuState = await worker.evaluate(() => globalThis.ImageReplacerMenus.state());
+    check('site menu item is checked once opted in', menuState.siteChecked === true, JSON.stringify(menuState));
+
+    await cold.close();
+
     const page = await context.newPage();
     const pageErrors = [];
     page.on('pageerror', (e) => pageErrors.push(String(e)));
@@ -255,6 +322,30 @@ async function main() {
       await page.getAttribute('#slowrestore', 'src'),
     );
 
+    // ---- menu item state follows the pointer -------------------------------
+    console.log('\nmenu state');
+
+    const hover = async (selector) => {
+      await page.evaluate((sel) => {
+        document
+          .querySelector(sel)
+          .dispatchEvent(new MouseEvent('mouseover', { bubbles: true, composed: true }));
+      }, selector);
+      await page.waitForTimeout(150);
+      return worker.evaluate(() => globalThis.ImageReplacerMenus.state());
+    };
+
+    const overImage = await hover('#plain');
+    check('Restore is enabled over a replaced image', overImage.restore === true, JSON.stringify(overImage));
+
+    const overNothing = await hover('#plainbox');
+    check('Restore is disabled over a plain element', overNothing.restore === false, JSON.stringify(overNothing));
+    check(
+      'Restore all stays enabled while the page has replacements',
+      overNothing.restoreAll === true,
+      JSON.stringify(overNothing),
+    );
+
     // ---- restore, driven the way the context menu drives it ----------------
     console.log('\nrestore');
 
@@ -341,14 +432,22 @@ async function main() {
     const replayed = await page.getAttribute('#plain', 'src');
     check('"Replace again" re-replaces a restored image', isMosaic(replayed));
 
-    // ---- toggle off restores, toggle on replaces --------------------------
-    console.log('\ntoggle');
-    await worker.evaluate(() => chrome.storage.local.set({ enabled: false }));
+    // ---- switching the site off restores, back on replaces -----------------
+    console.log('\nsite toggle');
+    await worker.evaluate(() =>
+      globalThis.ImageReplacerSites.setAllowed('127.0.0.1', false),
+    );
     await page.waitForTimeout(400);
     const offState = await page.getAttribute('#picimg', 'src');
-    check('disabling restores the page', offState === `${imgOrigin}/c.png`, offState);
+    check('switching the site off restores the page', offState === `${imgOrigin}/c.png`, offState);
 
-    await worker.evaluate(() => chrome.storage.local.set({ enabled: true }));
+    const offBadge = await worker.evaluate(async () => {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      return chrome.action.getBadgeText({ tabId: tab.id });
+    });
+    check('badge clears when the site is switched off', offBadge === '', `"${offBadge}"`);
+
+    await worker.evaluate(() => globalThis.ImageReplacerSites.setAllowed('127.0.0.1', true));
     await page
       .waitForFunction(
         (pixel) => {
@@ -360,7 +459,7 @@ async function main() {
       )
       .catch(() => {});
     const onState = await page.getAttribute('#picimg', 'src');
-    check('re-enabling replaces again', isMosaic(onState), onState);
+    check('switching it back on replaces again', isMosaic(onState), onState);
 
     // ---- unreachable source still gets replaced ---------------------------
     console.log('\nunreachable sources');
