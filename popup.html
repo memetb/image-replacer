@@ -1,13 +1,17 @@
 <!DOCTYPE html>
 <html>
     <head>
+        <meta charset="utf-8">
         <style>
-         body { width: 200px; padding: 10px; font-family: sans-serif; }
-         button { width: 100%; padding: 10px; font-size: 14px; cursor: pointer; }
+         body { width: 220px; padding: 12px; font: 13px/1.4 system-ui, sans-serif; }
+         button { width: 100%; padding: 10px; font-size: 13px; cursor: pointer; border-radius: 6px; border: 1px solid #ccc; background: #f6f6f6; }
+         button:hover { background: #ececec; }
+         p { margin: 10px 0 0; color: #666; }
         </style>
     </head>
     <body>
-        <button id="toggle">Disable Image Replacement</button>
+        <button id="toggle">Disable image replacement</button>
+        <p>Right-click a replaced image and choose <strong>Restore</strong> to bring the original back.</p>
         <script src="popup.js"></script>
     </body>
 </html>
