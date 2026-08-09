@@ -1,13 +1,19 @@
 {
     "manifest_version": 3,
     "name": "Image Replacer",
-    "version": "1.1",
-    "description": "Replaces every image on a page with a colour mosaic. Right-click any replaced image to restore it.",
+    "version": "1.2",
+    "description": "Replaces images with a colour mosaic on sites you switch it on for. Right-click a replaced image to restore it.",
     "permissions": ["storage", "contextMenus"],
     "host_permissions": ["<all_urls>"],
     "background": {
         "service_worker": "src/sw.js",
-        "scripts": ["src/replacement.js", "src/background.js"]
+        "scripts": [
+            "src/replacement.js",
+            "src/sites.js",
+            "src/indicator.js",
+            "src/menus.js",
+            "src/background.js"
+        ]
     },
     "browser_specific_settings": {
         "gecko": {

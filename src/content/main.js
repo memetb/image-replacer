@@ -15,7 +15,8 @@
   const IR = (globalThis.__IMAGE_REPLACER__ ||= {});
   if (IR.state) return;
 
-  IR.state = { enabled: true };
+  // Off until the background context says this site is opted in.
+  IR.state = { enabled: false };
 
   const CHUNK = 120;
 
@@ -149,19 +150,67 @@
 
   // --------------------------------------------------------- right-click UX
 
-  // The context menu fires in the service worker, by which time the event is
-  // long gone -- so remember what was under the cursor. `composedPath()` keeps
-  // this working for elements inside shadow DOM.
+  // The context menu fires in the background context, by which time the event
+  // is long gone -- so remember what was under the cursor. `composedPath()`
+  // keeps this working for elements inside shadow DOM.
   let lastPath = [];
+
+  const pathOf = (event) =>
+    typeof event.composedPath === 'function' ? event.composedPath() : [event.target];
+
   addEventListener(
     'contextmenu',
     (event) => {
-      lastPath = typeof event.composedPath === 'function' ? event.composedPath() : [event.target];
+      lastPath = pathOf(event);
+      reportTargets(lastPath, { deep: true });
     },
     true,
   );
 
+  // Track what's under the pointer so the menu items are already enabled or
+  // disabled correctly by the time the menu opens. `mouseover` fires when the
+  // pointer crosses into a new element rather than per pixel, and the report is
+  // skipped unless something changed, so this stays cheap.
+  let reported = '';
+
+  addEventListener(
+    'mouseover',
+    (event) => {
+      if (!IR.state.enabled) return;
+      reportTargets(pathOf(event));
+    },
+    true,
+  );
+
+  function reportTargets(path, options) {
+    if (!IR.pipeline.contextValid) return;
+
+    let targets;
+    try {
+      targets = IR.pipeline.inspectPath(path, options);
+    } catch {
+      return;
+    }
+
+    const signature = `${targets.restore}|${targets.restoreAll}|${targets.replace}`;
+    if (signature === reported) return;
+    reported = signature;
+
+    try {
+      chrome.runtime.sendMessage({ type: 'ir:targets', ...targets }, swallowError);
+    } catch {
+      /* extension reloaded */
+    }
+  }
+
+  const swallowError = () => void chrome.runtime.lastError;
+
   chrome.runtime.onMessage.addListener((msg) => {
+    if (msg?.type === 'ir:setActive') {
+      setEnabled(!!msg.active);
+      return;
+    }
+
     if (msg?.type !== 'ir:menu') return;
 
     if (msg.action === 'restore') {
@@ -220,6 +269,7 @@
   function setEnabled(next) {
     if (next === IR.state.enabled) return;
     IR.state.enabled = next;
+    reported = ''; // menu state is stale either way
 
     if (next) {
       IR.pipeline.replaceAll(); // undo any user restores
@@ -230,17 +280,23 @@
     }
   }
 
-  chrome.storage.onChanged.addListener((changes, area) => {
-    if (area === 'local' && changes.enabled) setEnabled(changes.enabled.newValue !== false);
-  });
-
-  chrome.storage.local.get('enabled', (data) => {
-    IR.state.enabled = data?.enabled !== false;
-    collect(document);
-  });
+  // The extension is off until told otherwise, and only the background context
+  // can tell us: a subframe knows its own URL, but "this site" means the site in
+  // the address bar. Nothing is touched until the answer arrives.
+  try {
+    chrome.runtime.sendMessage({ type: 'ir:active' }, (response) => {
+      swallowError();
+      if (response?.active) setEnabled(true);
+    });
+  } catch {
+    /* extension reloaded */
+  }
 
   // We start at document_start, so most of the page doesn't exist yet. Sweep
   // again at the points where large amounts of markup have landed.
-  document.addEventListener('DOMContentLoaded', () => collect(document), { once: true });
-  addEventListener('load', () => collect(document), { once: true });
+  const sweep = () => {
+    if (IR.state.enabled) collect(document);
+  };
+  document.addEventListener('DOMContentLoaded', sweep, { once: true });
+  addEventListener('load', sweep, { once: true });
 })();

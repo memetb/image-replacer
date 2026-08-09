@@ -137,6 +137,9 @@ function pageHtml(imgOrigin) {
   <img id="slownodim" src="${imgOrigin}/slow-nodim.png?ms=2500">
   <img id="slowrestore" width="90" height="60" src="${imgOrigin}/slow.png?ms=6000">
 
+  <!-- Carries nothing replaceable, for the menu-state checks. -->
+  <div id="plainbox">no image here</div>
+
   <div id="host"></div>
   <div id="later"></div>
 

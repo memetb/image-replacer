@@ -7,4 +7,10 @@
 //
 // Paths are root-relative so they resolve the same regardless of where this
 // file sits.
-importScripts('/src/replacement.js', '/src/background.js');
+importScripts(
+  '/src/replacement.js',
+  '/src/sites.js',
+  '/src/indicator.js',
+  '/src/menus.js',
+  '/src/background.js',
+);
