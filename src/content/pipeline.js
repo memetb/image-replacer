@@ -43,23 +43,27 @@
 
   // ------------------------------------------------------- worker round-trip
 
+  const DEAD_CONTEXT = /context invalidated|receiving end does not exist|extension context/i;
+
   function sendMessage(message) {
     return new Promise((resolve, reject) => {
-      let response;
       try {
-        response = chrome.runtime.sendMessage(message);
+        // Callback form, not the promise form: Chrome supports both, but
+        // Firefox's chrome.* namespace is callback-only and returns undefined.
+        chrome.runtime.sendMessage(message, (response) => {
+          const err = chrome.runtime.lastError;
+          if (err) {
+            if (DEAD_CONTEXT.test(err.message || '')) contextValid = false;
+            reject(new Error(err.message || 'sendMessage failed'));
+            return;
+          }
+          resolve(response);
+        });
       } catch (err) {
         // Thrown synchronously once the extension is reloaded/updated.
         contextValid = false;
         reject(err);
-        return;
       }
-      response.then(resolve, (err) => {
-        if (/context invalidated|receiving end does not exist/i.test(String(err?.message || err))) {
-          contextValid = false;
-        }
-        reject(err);
-      });
     });
   }
 

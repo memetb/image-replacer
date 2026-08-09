@@ -1,13 +1,23 @@
 # Image Replacer
 
-A Chrome (MV3) extension that replaces every image on a page with a colour
-mosaic built from that image's own palette, and lets you bring any of them back
-with a right-click.
+An MV3 browser extension for Chrome and Firefox that replaces every image on a
+page with a colour mosaic built from that image's own palette, and lets you
+bring any of them back with a right-click.
 
 ## Install
 
-`chrome://extensions` → enable Developer mode → **Load unpacked** → pick this
-folder.
+**Chrome / Edge** — `chrome://extensions` → enable Developer mode → **Load
+unpacked** → pick this folder.
+
+**Firefox** — `about:debugging#/runtime/this-firefox` → **Load Temporary
+Add-on** → pick `manifest.json`.
+
+> **Firefox users: grant host permissions.** Firefox MV3 treats
+> `host_permissions` as opt-in, so they are *not* granted on install. Open
+> `about:addons` → Image Replacer → Permissions → enable **Access your data for
+> all websites**. Without it the extension still replaces every image, but the
+> background fetch is blocked by CORS, so mosaics are synthesized from the image
+> URL rather than sampled from the image's own palette.
 
 ## Using it
 
@@ -41,7 +51,7 @@ draw to it as part of their normal operation.
 ```
                  adapters.js            pipeline.js           replacement.js
    DOM  ──read──▶ per-type    ──URLs──▶  the common  ──msg──▶  the modification
-        ◀─write── plumbing    ◀─data:──  path                  routine (worker)
+        ◀─write── plumbing    ◀─data:──  path                  routine (bg)
 ```
 
 **`src/replacement.js` is the single modification routine.** Every asset type,
@@ -59,7 +69,7 @@ source URLs off an element and how to write them back — `sources`, `capture`,
 replacement looks like. Supporting a new asset type means adding an adapter
 here and nothing else.
 
-**`src/background.js` runs the modification in the service worker**, not the
+**`src/background.js` runs the modification in the background context**, not the
 page. This is what makes replacement work at all: a content-script
 `fetch(url, { mode: 'cors' })` against a typical cross-origin image is rejected
 outright (`Failed to fetch`), because image hosts don't send
@@ -68,8 +78,27 @@ and isn't subject to the page's CORS rules. The worker also caches results
 across frames and tabs.
 
 If a source still can't be read — 404, opaque redirect, a `blob:` that has been
-revoked — the worker synthesizes a mosaic from a hash of the URL instead of
-giving up, so an asset is never left un-replaced.
+revoked, Firefox host permissions not yet granted — the background context
+synthesizes a mosaic from a hash of the URL instead of giving up, so an asset is
+never left un-replaced.
+
+### Running in both browsers
+
+Chrome MV3 wants a single `background.service_worker`; Firefox doesn't support
+that key at all and requires `background.scripts`. Rather than maintain two
+builds, the manifest declares both and they load the same classic scripts in the
+same order — Firefox straight from `background.scripts`, Chrome through
+`src/sw.js`, which is just an `importScripts` shim. Each browser ignores the key
+it doesn't use.
+
+That's also why the background code is classic scripts publishing a global
+rather than ES modules: `"type": "module"` for background scripts only landed in
+recent Firefox, while `importScripts` works everywhere MV3 does.
+
+The one other portability trap is the API namespace. Firefox exposes promises on
+`browser.*` but keeps `chrome.*` callback-only, so every extension API call here
+uses the callback form with a `chrome.runtime.lastError` check — that shape works
+identically in both.
 
 ### Restore
 
@@ -79,7 +108,7 @@ Replacing an asset snapshots the exact attributes it is about to overwrite
 original markup back rather than an approximation.
 
 The right-click target is captured in the content script from the `contextmenu`
-event's `composedPath()` — the service worker only learns which menu item was
+event's `composedPath()` — the background context only learns which menu item was
 clicked, not what was under the cursor, and `composedPath()` keeps this working
 inside shadow DOM. Restore looks for the nearest replaced ancestor first, then
 falls back to replaced descendants, so clicking the padding around an image
@@ -91,12 +120,28 @@ until you ask via "Replace again" or toggle the extension.
 ## Tests
 
 ```
-npm install     # playwright
-npm test
+npm install
+npm test              # end-to-end, in Chromium
+npm run lint:firefox  # validates the manifest against Firefox's schema
 ```
 
 `test/e2e.js` loads the unpacked extension into Chromium and drives a real page
 whose images are served **from a different port with no CORS headers** — the
 exact case that silently failed before. It checks every asset type in the table
 above, plus restore, restore-all, replace-again, the enable/disable toggle, and
-the unfetchable-source fallback.
+the unfetchable-source fallback. Set `IR_CHROMIUM` to point at a specific
+Chromium binary if Playwright's bundled one isn't what you want to test against.
+
+`npm run lint:firefox` runs `addons-linter` over the shippable files. It should
+report **0 errors**. Two warnings are expected:
+
+- `BACKGROUND_SERVICE_WORKER_IGNORED` — intentional, and the thing that makes
+  the dual-manifest approach work. It confirms Firefox is falling through to
+  `background.scripts`.
+- `MISSING_DATA_COLLECTION_PERMISSIONS` — only required to list on AMO. Adding
+  the key would force `strict_min_version` up to 140, which isn't worth dropping
+  Firefox 115–139 support for an extension that isn't listed.
+
+The e2e suite only exercises Chromium; there's no Firefox binary in the
+development container. Firefox coverage is schema validation plus manual
+testing.

@@ -14,6 +14,16 @@ const { startImageServer, startPageServer } = require('./fixtures');
 
 const EXT_PATH = path.resolve(__dirname, '..');
 
+/**
+ * Extensions need a full Chromium, not the headless shell. Prefer an explicit
+ * binary when one is available so the test doesn't depend on the installed
+ * Playwright happening to match a downloaded browser revision.
+ */
+function chromiumPath() {
+  const candidates = [process.env.IR_CHROMIUM, '/opt/pw-browsers/chromium'].filter(Boolean);
+  return candidates.find((p) => fs.existsSync(p)) || null;
+}
+
 let failures = 0;
 function check(name, ok, detail = '') {
   if (ok) {
@@ -35,8 +45,9 @@ async function main() {
   const pageServer = await listen(startPageServer(imgOrigin), 8801);
 
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ir-profile-'));
+  const executablePath = chromiumPath();
   const context = await chromium.launchPersistentContext(userDataDir, {
-    channel: 'chromium',
+    ...(executablePath ? { executablePath } : { channel: 'chromium' }),
     headless: true,
     args: [`--disable-extensions-except=${EXT_PATH}`, `--load-extension=${EXT_PATH}`],
   });
