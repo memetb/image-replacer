@@ -4,6 +4,9 @@ An MV3 browser extension for Chrome and Firefox that replaces every image on a
 page with a colour mosaic built from that image's own palette, and lets you
 bring any of them back with a right-click.
 
+Replacement happens in two passes: an image is blanked the instant it is seen,
+then upgraded to its mosaic when that is ready.
+
 ## Install
 
 **Chrome / Edge** — `chrome://extensions` → enable Developer mode → **Load
@@ -22,6 +25,7 @@ Add-on** → pick `manifest.json`.
 ## Using it
 
 - Images are replaced automatically on every page, including ones the page adds
+  later. Each one blanks immediately and fills in with its mosaic a moment
   later.
 - **Right-click → Restore** puts back the image under the cursor.
 - **Right-click → Restore all images on this page** puts back everything.
@@ -49,18 +53,63 @@ draw to it as part of their normal operation.
 ## How it fits together
 
 ```
-                 adapters.js            pipeline.js           replacement.js
-   DOM  ──read──▶ per-type    ──URLs──▶  the common  ──msg──▶  the modification
-        ◀─write── plumbing    ◀─data:──  path                  routine (bg)
+                 adapters.js         pipeline.js            blank.js
+   DOM  ──read──▶ per-type   ──1──▶  the common  ──sync──▶  fast pass
+        ◀─write── plumbing   ──2──▶  path        ──msg───▶  replacement.js
+                                                            slow pass (bg)
 ```
 
-**`src/replacement.js` is the single modification routine.** Every asset type,
-without exception, gets its replacement from `replacementFor()`. Changing how a
-replaced image looks means editing that one file.
+### The two passes
+
+`runAdapter()` runs both, in order, for every asset:
+
+| | fast pass | slow pass |
+| --- | --- | --- |
+| produces | a transparent image of the same size | the palette mosaic |
+| defined in | `src/content/blank.js` | `src/replacement.js` |
+| runs in | the page, synchronously | the background context |
+| cost | a string concat | a fetch, a decode and a rasterize |
+| when | the moment the element is discovered | when the round-trip returns |
+
+The fast pass exists because the slow one cannot be immediate: it needs a
+message round-trip and a network fetch, and until it returns the original would
+otherwise still be on screen. So the original is swapped for an empty SVG of the
+same intrinsic size — a string, so there is no canvas, no encoding and no async
+step — and the mosaic paints over it when it arrives.
+
+Both are reached through the same `runAdapter()`, which does the fast pass
+before its first `await`. Callers get it just by calling `runAdapter` without
+awaiting; there is no separate fast-pass entry point to forget.
+
+Two consequences worth knowing:
+
+- **Sizing.** The blank matches the original's box whenever the size is knowable
+  — `naturalWidth`, a `width`/`height` attribute, or a laid-out box. At
+  `document_start` an image with none of those has no knowable size, so the
+  blank falls back to a 1×1 pixel and the box settles when the mosaic lands with
+  the true dimensions. It errs small, so the page expands into place rather than
+  collapsing.
+- **The preload scanner still fetches the original.** It starts requesting
+  images while the HTML is being parsed, before the element is in the DOM and
+  before any content script can see it. The fast pass guarantees the response is
+  never *displayed*; it cannot stop the request. Blocking that would need
+  `declarativeNetRequest`, which is a much bigger hammer.
+
+Discovery is split to match. Adapters whose `match()` is a cheap tag test are
+run synchronously as elements appear, so the fast pass beats first paint. The
+CSS background adapter can't be — matching it means a `getComputedStyle` per
+element, far too expensive to do synchronously during parsing — so it goes
+through the idle queue.
+
+**`src/replacement.js` is the single slow-pass routine**, and
+`src/content/blank.js` the single fast-pass one. Every asset type, without
+exception, gets its mosaic from `replacementFor()` and its placeholder from
+`blank()`. Changing how a replaced image looks means editing one of those two
+files.
 
 **`src/content/pipeline.js` is the single common path.** `runAdapter()` is the
-only code that writes a replacement into the page, and `restoreRecord()` is the
-only code that undoes one. It owns the bookkeeping in between: what has been
+only code that writes a replacement into the page — either pass, every asset
+type — and `restoreRecord()` is the only code that undoes one. It owns the bookkeeping in between: what has been
 replaced, what the original looked like, and what must not be touched again.
 
 **`src/content/adapters.js` is pure plumbing.** An adapter says how to read
@@ -114,6 +163,11 @@ inside shadow DOM. Restore looks for the nearest replaced ancestor first, then
 falls back to replaced descendants, so clicking the padding around an image
 still does what you meant.
 
+Restore works from either pass. The snapshot is taken before the fast pass, so
+an asset still showing its blank restores just as well as one showing its
+mosaic; if its slow pass is still in flight, the mosaic is discarded when it
+arrives rather than painted over the restored original.
+
 A restored asset stays restored: the `MutationObserver` won't re-replace it
 until you ask via "Replace again" or toggle the extension.
 
@@ -128,9 +182,17 @@ npm run lint:firefox  # validates the manifest against Firefox's schema
 `test/e2e.js` loads the unpacked extension into Chromium and drives a real page
 whose images are served **from a different port with no CORS headers** — the
 exact case that silently failed before. It checks every asset type in the table
-above, plus restore, restore-all, replace-again, the enable/disable toggle, and
-the unfetchable-source fallback. Set `IR_CHROMIUM` to point at a specific
-Chromium binary if Playwright's bundled one isn't what you want to test against.
+above, plus both passes, restore, restore-all, replace-again, the enable/disable
+toggle, and the unfetchable-source fallback.
+
+The fast pass is checked against images whose responses the fixture server holds
+open, so the blank is observably in place before the mosaic can exist. Note that
+the blank's fallback placeholder is itself a `data:image/png` URL, so the test
+reads that constant out of `blank.js` — asserting only "is a PNG data URL" would
+pass on the placeholder and never notice a broken slow pass.
+
+Set `IR_CHROMIUM` to point at a specific Chromium binary if Playwright's bundled
+one isn't what you want to test against.
 
 `npm run lint:firefox` runs `addons-linter` over the shippable files. It should
 report **0 errors**. Two warnings are expected:

@@ -2,6 +2,14 @@
 //
 // Finds work and hands it to the pipeline: an initial sweep, a MutationObserver
 // for everything the page adds later, and the right-click actions.
+//
+// Discovery is split to match the two passes. Adapters whose `match()` is a
+// cheap tag test run the moment an element is seen, synchronously, so the fast
+// pass blanks it before it can paint -- usually before the browser has even
+// started fetching the original. The CSS background adapter can't: matching it
+// means a getComputedStyle call per element, which is far too expensive to do
+// synchronously while the document is still parsing, so it goes through the
+// idle queue with everything else.
 
 (() => {
   const IR = (globalThis.__IMAGE_REPLACER__ ||= {});
@@ -33,7 +41,10 @@
     if (root === toastHost) return;
 
     observeRoot(root);
-    if (root.nodeType === 1) pending.add(root);
+    if (root.nodeType === 1) {
+      pending.add(root);
+      fastPass(root);
+    }
 
     let all;
     try {
@@ -45,10 +56,31 @@
     for (const el of all) {
       if (el === toastHost) continue;
       pending.add(el);
+      fastPass(el);
       if (el.shadowRoot) collect(el.shadowRoot);
     }
 
     drainSoon();
+  }
+
+  /**
+   * Run the cheap-to-match adapters right now. `runAdapter` blanks the element
+   * before its first await, so not awaiting it here still guarantees the
+   * original is gone by the time this returns; the mosaic follows later.
+   */
+  function fastPass(el) {
+    if (!IR.state.enabled || !IR.pipeline.contextValid) return;
+
+    for (const adapter of IR.adapters) {
+      if (!adapter.eager) continue;
+      let matched = false;
+      try {
+        matched = adapter.match(el);
+      } catch {
+        continue;
+      }
+      if (matched) IR.pipeline.runAdapter(el, adapter);
+    }
   }
 
   function drainSoon() {
@@ -87,6 +119,9 @@
         // Skip the mutations our own writes generate, or we'd loop.
         if (IR.pipeline.isSelfInflicted(el, m.attributeName)) continue;
         if (el === toastHost) continue;
+        // A page swapping an image's src (carousels, lazy loaders) gets the
+        // same immediate blanking as one that was there at parse time.
+        fastPass(el);
         pending.add(el);
       }
     }

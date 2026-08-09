@@ -3,8 +3,14 @@
 // One adapter per asset type. An adapter is pure plumbing: it knows how to read
 // the source URLs off an element, how to write replacements back, and how to
 // undo that. It never decides *what* the replacement looks like -- that lives
-// in src/replacement.js, and every adapter reaches it through the single
-// pipeline in pipeline.js.
+// in blank.js (fast pass) and src/replacement.js (slow pass), and every adapter
+// reaches both through the single pipeline in pipeline.js. `apply()` is called
+// once per pass with whatever that pass produced.
+//
+// `eager: true` means match() is cheap enough to run synchronously on every
+// element as the document parses, which is what lets the fast pass blank an
+// asset before it paints. Only the CSS background adapter opts out: matching it
+// costs a getComputedStyle per element.
 //
 // Adding support for a new asset type means adding an adapter here and nothing
 // else.
@@ -38,6 +44,47 @@
   const boxOf = (el) => {
     const rect = typeof el.getBoundingClientRect === 'function' ? el.getBoundingClientRect() : null;
     return { width: Math.round(rect?.width || 0), height: Math.round(rect?.height || 0) };
+  };
+
+  const positiveInt = (value) => {
+    const n = parseInt(value, 10);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  };
+
+  /**
+   * Best-effort intrinsic size, used to size the fast pass's transparent
+   * placeholder. Ordered most to least authoritative. All of these can be zero
+   * at document_start, before layout and before the image has loaded -- that is
+   * expected, and blank() handles it.
+   */
+  const intrinsicSize = (el) => {
+    const box = boxOf(el);
+    return {
+      width: el.naturalWidth || positiveInt(el.getAttribute('width')) || box.width,
+      height: el.naturalHeight || positiveInt(el.getAttribute('height')) || box.height,
+    };
+  };
+
+  /**
+   * First candidate URL in a srcset, so an <img> carrying only a srcset can be
+   * blanked immediately instead of waiting for the browser to resolve one.
+   *
+   * Splitting on commas is not the full srcset grammar and will mangle a
+   * candidate whose URL contains an unencoded comma. That costs a palette --
+   * the slow pass falls back to a synthesized mosaic -- and never a correct
+   * blank, so it is the right trade for not showing the original.
+   */
+  const firstSrcsetCandidate = (el) => {
+    const raw =
+      el.getAttribute('srcset') ||
+      el.closest?.('picture')?.querySelector('source[srcset]')?.getAttribute('srcset') ||
+      '';
+    for (const part of raw.split(',')) {
+      const candidate = part.trim().split(/\s+/)[0];
+      const url = absolute(candidate, el);
+      if (url) return url;
+    }
+    return '';
   };
 
   const looksLikeImage = (type, url) =>
@@ -76,20 +123,17 @@
   /** Plain <img>, including the <picture> wrapper and any srcset variants. */
   const imgAdapter = {
     name: 'img',
+    eager: true,
     match: (el) => el.tagName === 'IMG',
 
     sources(el) {
       const url = el.currentSrc || el.src || absolute(el.getAttribute('src'), el);
-      return url ? [{ key: 'src', url }] : [];
+      if (url) return [{ key: 'src', url }];
+      const fromSrcset = firstSrcsetCandidate(el);
+      return fromSrcset ? [{ key: 'src', url: fromSrcset }] : [];
     },
 
-    hint(el) {
-      const box = boxOf(el);
-      return {
-        width: el.naturalWidth || box.width,
-        height: el.naturalHeight || box.height,
-      };
-    },
+    hint: intrinsicSize,
 
     capture(el) {
       const snap = { img: snapshotAttrs(el, ['src', 'srcset', 'sizes']), sources: [] };
@@ -127,12 +171,13 @@
   /** <input type="image"> -- a submit button rendered as an image. */
   const inputImageAdapter = {
     name: 'input-image',
+    eager: true,
     match: (el) => el.tagName === 'INPUT' && el.type === 'image',
     sources: (el) => {
       const url = el.src || absolute(el.getAttribute('src'), el);
       return url ? [{ key: 'src', url }] : [];
     },
-    hint: boxOf,
+    hint: intrinsicSize,
     capture: (el) => snapshotAttrs(el, ['src']),
     apply: (el, replacements) => el.setAttribute('src', replacements.get('src')),
     restore: restoreAttrs,
@@ -141,12 +186,13 @@
   /** <video poster="..."> -- the still frame shown before playback. */
   const posterAdapter = {
     name: 'video-poster',
+    eager: true,
     match: (el) => el.tagName === 'VIDEO' && !!el.getAttribute('poster'),
     sources: (el) => {
       const url = el.poster || absolute(el.getAttribute('poster'), el);
       return url ? [{ key: 'poster', url }] : [];
     },
-    hint: boxOf,
+    hint: intrinsicSize,
     capture: (el) => snapshotAttrs(el, ['poster']),
     apply: (el, replacements) => el.setAttribute('poster', replacements.get('poster')),
     restore: restoreAttrs,
@@ -155,6 +201,7 @@
   /** SVG <image>, which uses href and/or the legacy xlink:href. */
   const svgImageAdapter = {
     name: 'svg-image',
+    eager: true,
     match: (el) => el.namespaceURI === 'http://www.w3.org/2000/svg' && el.localName === 'image',
 
     sources(el) {
@@ -163,7 +210,7 @@
       return url ? [{ key: 'href', url }] : [];
     },
 
-    hint: boxOf,
+    hint: intrinsicSize,
     capture: (el) => snapshotAttrs(el, ['href', 'xlink:href']),
 
     apply(el, replacements) {
@@ -183,6 +230,7 @@
   /** <object> / <embed> pointing at an image. */
   const embeddedAdapter = {
     name: 'embedded',
+    eager: true,
     match(el) {
       if (el.tagName === 'OBJECT') return looksLikeImage(el.type, el.getAttribute('data'));
       if (el.tagName === 'EMBED') return looksLikeImage(el.type, el.getAttribute('src'));
@@ -193,7 +241,7 @@
       const url = absolute(el.getAttribute(attr), el);
       return url ? [{ key: attr, url }] : [];
     },
-    hint: boxOf,
+    hint: intrinsicSize,
     capture: (el) => snapshotAttrs(el, ['data', 'src']),
     apply(el, replacements) {
       const attr = el.tagName === 'OBJECT' ? 'data' : 'src';

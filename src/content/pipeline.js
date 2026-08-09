@@ -2,9 +2,18 @@
 //
 // The common path. Every asset -- whatever its type -- is replaced by
 // `runAdapter()` and undone by `restoreRecord()`. Adapters supply the read/write
-// plumbing; the service worker supplies the pixels; this file owns the
-// bookkeeping that sits between them: what has been touched, what the original
-// looked like, and what must not be touched again.
+// plumbing; blank.js and the background context supply the pixels; this file
+// owns the bookkeeping that sits between them: what has been touched, what the
+// original looked like, and what must not be touched again.
+//
+// `runAdapter()` runs both passes in order:
+//
+//   fast   synchronous, before the first await, so the original is replaced the
+//          moment the element is seen. Every caller gets this for free just by
+//          calling runAdapter -- there is no separate fast-pass entry point to
+//          forget about.
+//   slow   awaits the mosaic from the background context and applies it over
+//          the blank, unless the state changed while we were waiting.
 
 (() => {
   const IR = (globalThis.__IMAGE_REPLACER__ ||= {});
@@ -121,17 +130,45 @@
 
   // ------------------------------------------------------------ the pipeline
 
+  /** States in which the element is showing our output and can be restored. */
+  const ACTIVE = new Set(['blanked', 'replaced']);
+
+  /** Write one set of values through the adapter and remember what we wrote. */
+  function write(record, el, adapter, values) {
+    try {
+      adapter.apply(el, values);
+    } catch (err) {
+      console.debug('[image-replacer] could not apply', adapter.name, err?.message || err);
+      return false;
+    }
+
+    for (const value of values.values()) {
+      applied.add(value);
+      record.applied.add(value);
+    }
+    // The inline style we just wrote, so self-inflicted mutations are ignored.
+    // Only when non-empty: recording '' would make every later style change
+    // on an element without an inline background look like one of ours.
+    const inlineBg = el.style?.getPropertyValue('background-image');
+    if (inlineBg) record.applied.add(inlineBg);
+
+    return true;
+  }
+
   /**
-   * Replace one asset. This is the only function that writes a replacement into
-   * the page, for every asset type.
+   * Replace one asset, fast pass then slow pass. This is the only function that
+   * writes a replacement into the page, for every asset type.
+   *
+   * Everything up to the first `await` is the fast pass, so calling this
+   * without awaiting it still blanks the element synchronously.
    */
   async function runAdapter(el, adapter, { force = false } = {}) {
     if (!contextValid) return false;
 
-    const record = getRecord(el, adapter.name);
-    if (record?.state === 'working') return false;
+    const existing = getRecord(el, adapter.name);
+    if (existing?.busy && !force) return false;
     // A restored asset stays restored until the user explicitly asks otherwise.
-    if (record?.state === 'restored' && !force) return false;
+    if (existing?.state === 'restored' && !force) return false;
 
     let sources;
     try {
@@ -148,64 +185,91 @@
     const stale = sources.filter((s) => s.url && !isOurs(s.url));
     if (!stale.length && !force) return false; // already fully replaced
 
-    const working = record || { el, adapter, state: 'working', applied: new Set() };
-    working.state = 'working';
-    setRecord(el, adapter.name, working);
+    const record = existing || { el, adapter, state: 'idle', applied: new Set() };
+    record.busy = true;
+    setRecord(el, adapter.name, record);
 
+    // ---------------------------------------------------------- fast pass
+    // Read the size before blanking: afterwards the element measures the
+    // placeholder, not the original.
+    let hint;
     try {
-      const hint = adapter.hint?.(el) || { width: 0, height: 0 };
-      const replacements = new Map();
+      hint = adapter.hint?.(el) || { width: 0, height: 0 };
+    } catch {
+      hint = { width: 0, height: 0 };
+    }
+
+    // Snapshot only from an authentic page state. If some sources are already
+    // ours the DOM is half-ours, so the earlier snapshot is the real original.
+    const authentic = stale.length === sources.length;
+    if (!record.snapshot || authentic) {
+      try {
+        record.snapshot = adapter.capture(el);
+      } catch (err) {
+        record.busy = false;
+        console.debug('[image-replacer] could not capture', adapter.name, err?.message || err);
+        return false;
+      }
+    }
+
+    const blankUrl = IR.blank(hint.width, hint.height);
+    const blanks = new Map(
+      // Layers already carrying our own output are passed through untouched, so
+      // multi-layer values (CSS backgrounds) rebuild in the right order and an
+      // already-mosaicked layer doesn't flicker back to blank.
+      sources.map((s) => [s.key, isOurs(s.url) && !force ? s.url : blankUrl]),
+    );
+
+    if (!write(record, el, adapter, blanks)) {
+      record.busy = false;
+      return false;
+    }
+    record.state = 'blanked';
+
+    // ---------------------------------------------------------- slow pass
+    try {
+      const mosaics = new Map();
 
       await Promise.all(
         sources.map(async (source) => {
-          // Layers already carrying our own output are passed through untouched
-          // so multi-layer values (CSS backgrounds) rebuild in the right order.
           if (isOurs(source.url) && !force) {
-            replacements.set(source.key, source.url);
+            mosaics.set(source.key, source.url);
             return;
           }
           const dataUrl = await schedule(() => fetchReplacement(source.url, hint));
-          if (typeof dataUrl === 'string') replacements.set(source.key, dataUrl);
+          if (typeof dataUrl === 'string') mosaics.set(source.key, dataUrl);
         }),
       );
 
+      // The user may have restored, or the page swapped the asset, while the
+      // mosaic was in flight. The blank stands; don't paint over the new state.
+      if (record.state !== 'blanked') return false;
+
       // Bail rather than write a partial value; a half-applied CSS background
-      // is worse than an untouched one.
-      if (replacements.size !== sources.length) {
-        working.state = record?.snapshot ? 'replaced' : 'idle';
-        return false;
-      }
+      // is worse than one left blank.
+      if (mosaics.size !== sources.length) return false;
 
-      // Snapshot only from an authentic page state. If some sources are already
-      // ours the DOM is half-ours, so the earlier snapshot is the real original.
-      const authentic = stale.length === sources.length;
-      if (!working.snapshot || authentic) working.snapshot = adapter.capture(el);
-
-      adapter.apply(el, replacements);
-
-      for (const value of replacements.values()) {
-        applied.add(value);
-        working.applied.add(value);
-      }
-      // The inline style we just wrote, so self-inflicted mutations are ignored.
-      // Only when non-empty: recording '' would make every later style change
-      // on an element without an inline background look like one of ours.
-      const inlineBg = el.style?.getPropertyValue('background-image');
-      if (inlineBg) working.applied.add(inlineBg);
-
-      working.state = 'replaced';
+      if (!write(record, el, adapter, mosaics)) return false;
+      record.state = 'replaced';
       return true;
     } catch (err) {
-      working.state = 'idle';
+      // The element keeps the blank, which is still a replacement -- the
+      // original does not come back on failure.
       if (!contextValid) return false;
-      console.debug('[image-replacer] could not replace', adapter.name, err?.message || err);
+      console.debug('[image-replacer] no mosaic for', adapter.name, err?.message || err);
       return false;
+    } finally {
+      record.busy = false;
     }
   }
 
-  /** Undo one replacement, returning the element to its captured original. */
+  /**
+   * Undo one replacement, returning the element to its captured original.
+   * Works from either pass -- the snapshot is taken before the fast pass, so a
+   * blanked element that has no mosaic yet restores just as well.
+   */
   function restoreRecord(record) {
-    if (!record || record.state !== 'replaced' || !record.snapshot) return false;
+    if (!record || !ACTIVE.has(record.state) || !record.snapshot) return false;
     try {
       record.adapter.restore(record.el, record.snapshot);
       record.state = 'restored';
@@ -258,7 +322,7 @@
     return byName ? [...byName.values()] : [];
   }
 
-  const replacedRecordsFor = (el) => recordsFor(el).filter((r) => r.state === 'replaced');
+  const activeRecordsFor = (el) => recordsFor(el).filter((r) => ACTIVE.has(r.state));
 
   /**
    * Resolve a right-click into something to restore.
@@ -270,7 +334,7 @@
   function restoreFromPath(path) {
     for (const node of path) {
       if (node?.nodeType !== 1) continue;
-      const hits = replacedRecordsFor(node);
+      const hits = activeRecordsFor(node);
       if (hits.length) return hits.filter(restoreRecord).length;
     }
 
@@ -279,7 +343,7 @@
 
     let count = 0;
     for (const el of target.querySelectorAll('*')) {
-      count += replacedRecordsFor(el).filter(restoreRecord).length;
+      count += activeRecordsFor(el).filter(restoreRecord).length;
     }
     return count;
   }

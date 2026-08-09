@@ -78,6 +78,8 @@ function startImageServer() {
       '/shadow.png': [50, 50, [200, 120, 200]],
       '/late.png': [80, 80, [60, 160, 90]],
       '/obj.png': [55, 55, [160, 160, 30]],
+      '/slow.png': [120, 80, [200, 60, 140]],
+      '/slow-nodim.png': [140, 70, [60, 200, 140]],
     };
     const spec = sizes[name];
     if (!spec) {
@@ -86,8 +88,15 @@ function startImageServer() {
     }
     const png = makePng(spec[0], spec[1], spec[2]);
     // Deliberately NO Access-Control-Allow-Origin.
-    res.writeHead(200, { 'Content-Type': 'image/png', 'Content-Length': png.length });
-    res.end(png);
+    const send = () => {
+      res.writeHead(200, { 'Content-Type': 'image/png', 'Content-Length': png.length });
+      res.end(png);
+    };
+    // `?ms=` holds the response open so the test can observe the fast pass
+    // before the slow pass has anything to apply.
+    const delay = Number(new URL(req.url, 'http://x').searchParams.get('ms')) || 0;
+    if (delay) setTimeout(send, delay);
+    else send();
   });
   return server;
 }
@@ -122,6 +131,11 @@ function pageHtml(imgOrigin) {
   <input id="btn" type="image" src="${imgOrigin}/btn.png">
 
   <object id="obj" type="image/png" data="${imgOrigin}/obj.png" width="55" height="55"></object>
+
+  <!-- Held open server-side so the fast pass is observable before the mosaic. -->
+  <img id="slowimg" width="120" height="80" src="${imgOrigin}/slow.png?ms=2500">
+  <img id="slownodim" src="${imgOrigin}/slow-nodim.png?ms=2500">
+  <img id="slowrestore" width="90" height="60" src="${imgOrigin}/slow.png?ms=6000">
 
   <div id="host"></div>
   <div id="later"></div>

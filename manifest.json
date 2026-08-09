@@ -28,6 +28,7 @@
         {
             "matches": ["<all_urls>"],
             "js": [
+                "src/content/blank.js",
                 "src/content/adapters.js",
                 "src/content/pipeline.js",
                 "src/content/main.js"
